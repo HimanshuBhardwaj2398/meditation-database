@@ -1,5 +1,53 @@
 # Environment variables
 .env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+.eggs/
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
 
 # Experiments
 experiments/
+
+# Docker volumes (local)
+postgres_data/
+
+# Logs
+*.log
+
+# Type checking
+.mypy_cache/
+
+# Ruff
+.ruff_cache/
+
+# Claude context (may contain personal project notes)
+claude.md

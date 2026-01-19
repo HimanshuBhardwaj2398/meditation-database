@@ -1,10 +1,9 @@
-import os
-
-os.chdir("/Users/himanshu/projects/journalling-assitant")
-import sys
-
-sys.path.append(os.getcwd())
+"""
+Document ingestion orchestrator module.
+Orchestrates the document ingestion pipeline: parsing, chunking, and embedding.
+"""
 import logging
+import os
 from typing import Union, List, Dict, Any, Optional
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy import create_engine

@@ -1,0 +1,56 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv/
+ENV/
+.eggs/
+*.egg-info/
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Documentation
+docs/_build/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Environment files (use docker-compose env instead)
+.env
+.env.local
+.env.*.local
+
+# Docker
+docker-compose*.yml
+Dockerfile*
+.docker/
+
+# Misc
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Large files that shouldn't be in the image
+Books/
+experiments/
+*.pdf

@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      - DB_URL=postgresql://journalling:journalling@db:5432/journalling
+      - EMBEDDING_VOYAGE_API_KEY=${VOYAGE_API_KEY}
+      - PARSING_LLAMAPARSE_API_KEY=${LLAMAPARSE_API}
+      - LOG_LEVEL=INFO
+      - ENVIRONMENT=production
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - documents:/app/documents
+      - ../Books:/app/Books:ro
+    networks:
+      - journalling-net
+    restart: unless-stopped
+
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: journalling
+      POSTGRES_PASSWORD: journalling
+      POSTGRES_DB: journalling
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U journalling -d journalling"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - journalling-net
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["python", "-c", "from db.database import init_db; init_db()"]
+    environment:
+      - DB_URL=postgresql://journalling:journalling@db:5432/journalling
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - journalling-net
+    profiles:
+      - migrate
+
+volumes:
+  postgres_data:
+    name: journalling_postgres_data
+  documents:
+    name: journalling_documents
+
+networks:
+  journalling-net:
+    driver: bridge

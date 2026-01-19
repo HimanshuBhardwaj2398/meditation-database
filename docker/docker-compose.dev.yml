@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.dev
+    environment:
+      - DB_URL=postgresql://journalling:journalling@db:5432/journalling_dev
+      - DATABASE_URL=postgresql://journalling:journalling@db:5432/journalling_dev
+      - EMBEDDING_VOYAGE_API_KEY=${VOYAGE_API_KEY}
+      - PARSING_LLAMAPARSE_API_KEY=${LLAMAPARSE_API}
+      - LOG_LEVEL=DEBUG
+      - ENVIRONMENT=development
+    volumes:
+      - ..:/app
+      - /app/.venv
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - journalling-dev
+    stdin_open: true
+    tty: true
+
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: journalling
+      POSTGRES_PASSWORD: journalling
+      POSTGRES_DB: journalling_dev
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U journalling -d journalling_dev"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - journalling-dev
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@local.dev
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "8080:80"
+    networks:
+      - journalling-dev
+    profiles:
+      - tools
+
+volumes:
+  postgres_dev_data:
+    name: journalling_postgres_dev_data
+
+networks:
+  journalling-dev:
+    driver: bridge

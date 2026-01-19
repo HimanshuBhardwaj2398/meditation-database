@@ -4,12 +4,15 @@ A robust database and retrieval infrastructure for meditation philosophy texts. 
 
 ## Overview
 
-This repository serves as the foundational data layer for a broader ecosystem of meditation-focused AI tools. It handles:
+This repository serves as the foundational data layer for a broader ecosystem of meditation-focused AI tools. It provides both the database infrastructure and query layer for AI-assisted contemplative practice applications.
 
+**Current Focus (Phase 1)**: Building the data foundation
 - **Document Ingestion**: Parse PDFs and web content into structured markdown
 - **Semantic Chunking**: Intelligent text splitting that preserves meaning and context
 - **Vector Embeddings**: High-quality embeddings for semantic similarity search
 - **PostgreSQL + pgvector**: Scalable vector storage with full SQL capabilities
+
+**Future Focus (Phase 2)**: Query layer with multiple API interfaces (RAG, GraphRAG) for different use cases like meditation journaling, technique guidance, and path exploration.
 
 ## Architecture
 
@@ -191,11 +194,53 @@ This project includes translations of the Pali Canon by Bhikkhu Sujato:
 
 ## Roadmap
 
-- [ ] REST API layer for retrieval endpoints
-- [ ] Multi-modal support (audio dharma talks)
-- [ ] Additional text traditions (Zen, Tibetan, Vedantic)
-- [ ] Query interface for semantic search
-- [ ] Integration APIs for downstream AI tools
+### Phase 1: Data Layer (Current)
+- [x] PDF and web content parsing pipeline
+- [x] Semantic chunking with context preservation
+- [x] Vector embedding and storage (Voyage AI + pgvector)
+- [x] Document status tracking and resume capabilities
+- [ ] Incremental indexing for new content
+- [ ] Additional text traditions (Zen, Tibetan, Vedantic literature)
+
+### Phase 2: Query Layer (Upcoming)
+- [ ] **RAG API**: Simple semantic search with context-aware retrieval
+  - Citation tracking back to source suttas
+  - Relevance scoring and ranking
+  - Streaming responses for long-form answers
+- [ ] **GraphRAG API**: Relationship-aware queries with multi-hop reasoning
+  - Knowledge graph construction from chunks
+  - Entity extraction (concepts, practices, teachers)
+  - Conceptual connections and prerequisite relationships
+- [ ] **Custom Query APIs**: Specialized endpoints for specific use cases
+  - Technique-specific searches
+  - Practice progression tracking
+  - Personalized recommendations
+
+### Phase 3: Application Integration
+- [ ] **Meditation Journaling App**: Suggest relevant teachings based on journal entries
+- [ ] **Practice Guidance Tool**: Answer technique questions with citations
+- [ ] **Path Exploration Interface**: Navigate interconnected concepts
+- [ ] **Daily Reflection Generator**: Contextual wisdom for specific situations
+- [ ] Multi-modal support (audio dharma talks, video transcripts)
+
+## Development
+
+### Using with Claude
+
+This project includes a `claude.md` file that provides comprehensive context about the architecture, design decisions, and development patterns. If you're using Claude for development assistance:
+
+1. The `claude.md` file is excluded from git (in `.gitignore`)
+2. Share it with Claude to get contextual help with the codebase
+3. Update it as the architecture evolves
+
+### Contributing
+
+When making changes:
+- Follow the established async/await patterns
+- Add type hints to all new functions
+- Update `claude.md` if architecture changes significantly
+- Maintain Pydantic settings for new configuration
+- Test with sample Buddhist texts in `Books/` directory
 
 ## License
 
