@@ -1,52 +1,201 @@
 """
-Document ingestion orchestrator module.
-Orchestrates the document ingestion pipeline: parsing, chunking, and embedding.
+DAG-based pipeline orchestrator for document ingestion.
+
+Replaces linear state machine with dependency-aware stage execution.
 """
+
 import logging
 import os
 from typing import Union, List, Dict, Any, Optional
-from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy import create_engine
-import re
-import asyncio
 
-# Import from your existing files
-from db import Document, DocumentStatus, session_scope
-from ingestion import html_to_markdown, parse_pdf
-from ingestion import MarkdownChunker, Config as ChunkingConfig
-from ingestion import VectorStoreManager, VectorStoreConfig
+from core.interfaces import PipelineStage, PipelineContext, StageStatus
+from core.exceptions import PipelineError, DatabaseError
+from ingestion.parsing import ParserFactory
+from ingestion.chunking import Config as ChunkingConfig
+from ingestion.embed import VectorStoreManager, VectorStoreConfig
+from ingestion.stages import ParsingStage, ChunkingStage, EmbeddingStage
 
-# from database import session_scope
-
-# LangChain's Document class for type hinting
+# LangChain Document for type hints
 from langchain.schema import Document as LangchainDocument
 
-# --- Logging Configuration ---
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logger = logging.getLogger(__name__)
 
 
-# --- Helper Functions for Serialization ---
+# ============================================================================
+# SERIALIZATION HELPERS (kept for backward compatibility)
+# ============================================================================
+
 def serialize_docs(docs: List[LangchainDocument]) -> List[Dict[str, Any]]:
-    """Converts a list of Langchain Documents to a JSON-serializable format."""
+    """Converts Langchain Documents to JSON-serializable format."""
     return [
-        {"page_content": doc.page_content, "metadata": doc.metadata} for doc in docs
+        {"page_content": doc.page_content, "metadata": doc.metadata}
+        for doc in docs
     ]
 
 
 def deserialize_docs(serialized_docs: List[Dict[str, Any]]) -> List[LangchainDocument]:
-    """Converts a list of serialized documents back into Langchain Document objects."""
+    """Converts serialized documents back to Langchain Documents."""
     return [
         LangchainDocument(page_content=doc["page_content"], metadata=doc["metadata"])
         for doc in serialized_docs
     ]
 
 
+# ============================================================================
+# DAG PIPELINE ORCHESTRATOR
+# ============================================================================
+
+class PipelineOrchestrator:
+    """
+    DAG-based pipeline orchestrator with automatic dependency resolution.
+
+    Stages are executed in topological order based on their dependencies.
+    Each stage is idempotent and can be resumed from any point.
+    """
+
+    def __init__(self, stages: List[PipelineStage]):
+        """
+        Initialize orchestrator with pipeline stages.
+
+        Args:
+            stages: List of pipeline stages to execute
+
+        Raises:
+            PipelineError: If stage dependencies form a cycle
+        """
+        self._stages = stages
+        self._stage_map = {stage.name: stage for stage in stages}
+        self._validate_dag()
+        self._execution_order = self._topological_sort()
+
+        logger.debug(f"Pipeline execution order: {[s.name for s in self._execution_order]}")
+
+    def _validate_dag(self):
+        """
+        Validate that stage dependencies form a valid DAG (no cycles).
+
+        Raises:
+            PipelineError: If circular dependency detected
+        """
+        visited = set()
+        rec_stack = set()
+
+        def has_cycle(stage_name: str) -> bool:
+            visited.add(stage_name)
+            rec_stack.add(stage_name)
+
+            stage = self._stage_map.get(stage_name)
+            if stage:
+                for dependency in stage.required_stages:
+                    if dependency not in visited:
+                        if has_cycle(dependency):
+                            return True
+                    elif dependency in rec_stack:
+                        return True
+
+            rec_stack.remove(stage_name)
+            return False
+
+        for stage_name in self._stage_map.keys():
+            if stage_name not in visited:
+                if has_cycle(stage_name):
+                    raise PipelineError(f"Circular dependency detected in pipeline stages")
+
+        logger.debug("DAG validation passed - no cycles detected")
+
+    def _topological_sort(self) -> List[PipelineStage]:
+        """
+        Sort stages in execution order using topological sort.
+
+        Returns:
+            List of stages in dependency order
+        """
+        in_degree = {stage.name: 0 for stage in self._stages}
+
+        # Calculate in-degrees
+        for stage in self._stages:
+            for dependency in stage.required_stages:
+                if dependency in in_degree:
+                    in_degree[dependency] += 1
+
+        # Find stages with no dependencies
+        queue = [stage for stage in self._stages if in_degree[stage.name] == 0]
+        result = []
+
+        while queue:
+            stage = queue.pop(0)
+            result.append(stage)
+
+            # Reduce in-degree for dependent stages
+            for other_stage in self._stages:
+                if stage.name in other_stage.required_stages:
+                    in_degree[other_stage.name] -= 1
+                    if in_degree[other_stage.name] == 0:
+                        queue.append(other_stage)
+
+        if len(result) != len(self._stages):
+            raise PipelineError("Unable to determine stage execution order")
+
+        return result
+
+    async def execute(self, context: PipelineContext) -> PipelineContext:
+        """
+        Execute pipeline stages in dependency order.
+
+        Args:
+            context: Initial pipeline context
+
+        Returns:
+            Final context after all stages
+        """
+        current_context = context
+
+        for stage in self._execution_order:
+            # Skip if already completed
+            if stage.should_skip(current_context):
+                logger.info(f"Skipping stage '{stage.name}' (already completed)")
+                continue
+
+            # Check if dependencies are met
+            if not stage.can_run(current_context):
+                missing = [
+                    dep for dep in stage.required_stages
+                    if current_context.stage_results.get(dep) != StageStatus.COMPLETED
+                ]
+                logger.warning(
+                    f"Stage '{stage.name}' cannot run. Missing dependencies: {missing}"
+                )
+                continue
+
+            # Execute stage
+            logger.info(f"Executing stage: {stage.name}")
+            try:
+                current_context = await stage.execute(current_context)
+
+                # Check if stage failed
+                if current_context.stage_results.get(stage.name) == StageStatus.FAILED:
+                    error = current_context.error_messages.get(stage.name, "Unknown error")
+                    logger.error(f"Stage '{stage.name}' failed: {error}")
+                    # Continue to next stage (allows partial processing)
+
+            except Exception as e:
+                logger.error(f"Unexpected error in stage '{stage.name}': {e}", exc_info=True)
+                current_context = current_context.mark_stage_failed(stage.name, str(e))
+
+        return current_context
+
+
+# ============================================================================
+# HIGH-LEVEL INGESTION ORCHESTRATOR (backward compatible API)
+# ============================================================================
+
 class IngestionOrchestrator:
     """
-    Orchestrates the document ingestion pipeline: parsing, chunking, and embedding.
-    It acts as a state machine, processing documents based on their current status.
+    High-level orchestrator for document ingestion.
+
+    Provides backward-compatible API while using DAG pipeline internally.
+    Note: Database persistence is not included in Phase 1 (code refactoring only).
+    Database integration will be added in Phase 2 after schema is created.
     """
 
     def __init__(
@@ -54,198 +203,121 @@ class IngestionOrchestrator:
         vector_store_config: VectorStoreConfig,
         chunking_config: Optional[ChunkingConfig] = None,
     ):
+        """
+        Initialize ingestion orchestrator.
+
+        Args:
+            vector_store_config: Configuration for vector store
+            chunking_config: Configuration for chunking (optional)
+        """
+        self.vector_store_config = vector_store_config
+        self.chunking_config = chunking_config or ChunkingConfig()
+
+        # Initialize components
+        self.parser_factory = ParserFactory()
         self.vector_store_manager = VectorStoreManager(config=vector_store_config)
-        self.chunking_config = chunking_config
-        logging.info("Orchestrator initialized.")
 
-    async def process(self, source: Union[str, int]) -> int:
-        """
-        Main entry point to process a document.
-        Returns the document ID instead of the detached instance.
-        """
-        with session_scope() as db:
-            doc = self._get_or_create_document(source, db)
-            doc_id = doc.id  # Get the ID while session is active
+        logger.info("IngestionOrchestrator initialized with DAG pipeline")
 
-            try:
-                await self._run_pipeline(doc, db)
-                return doc_id
-            except Exception as e:
-                logging.error(
-                    f"Critical error in pipeline for doc {doc.id}: {e}", exc_info=True
-                )
-                self._update_status(doc, DocumentStatus.FAILED, str(e), db)
-                raise
+    async def process(self, source: Union[str, int]) -> Dict[str, Any]:
+        """
+        Process a document through the ingestion pipeline.
 
-    def _get_or_create_document(self, source: Union[str, int], db: Session) -> Document:
-        """
-        Retrieves a document from the DB if an ID is provided,
-        or creates a new one if a file path is provided.
-        """
-        if isinstance(source, int):
-            logging.info(f"Resuming processing for document ID: {source}")
-            doc = db.query(Document).filter(Document.id == source).first()
-            if not doc:
-                raise ValueError(f"No document found with ID {source}")
-            return doc
-        elif isinstance(source, str):
-            logging.info(f"Starting new ingestion for source: {source}")
-            doc = Document(file_path=source, status=DocumentStatus.PENDING)
-            db.add(doc)
-            db.commit()
-            db.refresh(doc)
-            return doc
-        else:
-            raise TypeError(
-                "Source must be either a string (file path/URL) or an integer (document ID)"
-            )
+        Args:
+            source: File path, URL, or document ID to resume
 
-    async def _run_pipeline(self, doc: Document, db: Session) -> None:
+        Returns:
+            Dictionary with processing results:
+                - source: Original source
+                - title: Extracted title
+                - chunk_count: Number of chunks created
+                - stage_results: Status of each stage
+                - errors: Any error messages
         """
-        Executes the ingestion pipeline steps based on the document's current status.
-        """
-        logging.info(
-            f"Running pipeline for doc {doc.id} with status: {doc.status.value}"
+        # For Phase 1: Process without database
+        # Database integration will be added in Phase 2
+
+        # Build pipeline stages
+        stages = [
+            ParsingStage(self.parser_factory),
+            ChunkingStage(self.chunking_config),
+            EmbeddingStage(self.vector_store_manager),
+        ]
+
+        # Create orchestrator
+        pipeline = PipelineOrchestrator(stages)
+
+        # Build initial context
+        context = PipelineContext(
+            source=source if isinstance(source, str) else None,
         )
 
-        # --- PARSING STAGE ---
-        if doc.status in [DocumentStatus.PENDING, DocumentStatus.PARSING]:
-            self._parse(doc, db)
-
-        # --- CHUNKING STAGE ---
-        if doc.status == DocumentStatus.PARSED:
-            await self._chunk(doc, db)
-
-        # --- EMBEDDING STAGE ---
-        if doc.status == DocumentStatus.CHUNKED:
-            self._embed(doc, db)
-
-        if doc.status == DocumentStatus.COMPLETED:
-            logging.info(f"Document {doc.id} has already been processed successfully.")
-
-    def _update_status(
-        self,
-        doc: Document,
-        status: DocumentStatus,
-        details: Optional[str] = None,
-        db: Session = None,
-    ):
-        """Safely updates the document's status in the database."""
-        doc.status = status
-        doc.status_details = details
-        if db:
-            db.commit()
-        logging.info(f"Updated doc {doc.id} status to: {status.value}")
-
-    def _parse(self, doc: Document, db: Session):
-        """Step 1: Parse the document from its source file path."""
-        self._update_status(doc, DocumentStatus.PARSING, db=db)
         try:
-            content = None
-            if re.match(r"^https?://", doc.file_path, re.IGNORECASE):
-                logging.info(f"Parsing URL: {doc.file_path}")
-                content = html_to_markdown(doc.file_path)
-            elif doc.file_path.lower().endswith(".pdf"):
-                logging.info(f"Parsing PDF: {doc.file_path}")
-                content = parse_pdf(doc.file_path)
+            # Execute pipeline
+            logger.info(f"Starting pipeline for source: {source}")
+            final_context = await pipeline.execute(context)
+
+            # Check completion status
+            embedding_status = final_context.stage_results.get("embedding")
+            success = embedding_status == StageStatus.COMPLETED
+
+            # Build result
+            result = {
+                "source": context.source,
+                "title": final_context.title,
+                "chunk_count": len(final_context.chunks),
+                "stage_results": {
+                    name: status.value
+                    for name, status in final_context.stage_results.items()
+                },
+                "errors": final_context.error_messages,
+                "success": success
+            }
+
+            if success:
+                logger.info(f"Pipeline completed successfully for: {source}")
             else:
-                raise ValueError(f"Unsupported file type for: {doc.file_path}")
+                logger.warning(f"Pipeline partially completed for: {source}")
 
-            if not content:
-                raise ValueError("Parsing resulted in empty content.")
+            return result
 
-            doc.markdown = content
-            # Simple title extraction from the first H1 tag
-            match = re.search(r"^#\s+(.+)$", content.strip(), re.MULTILINE)
-            if match:
-                doc.title = match.group(1).strip()
-
-            self._update_status(doc, DocumentStatus.PARSED, db=db)
         except Exception as e:
-            logging.error(f"Parsing failed for doc {doc.id}: {e}", exc_info=True)
-            self._update_status(
-                doc, DocumentStatus.FAILED, f"Parsing failed: {e}", db=db
-            )
-            raise
+            logger.error(f"Pipeline failed for source {source}: {e}", exc_info=True)
+            raise PipelineError(f"Pipeline execution failed: {e}") from e
 
-    async def _chunk(self, doc: Document, db: Session):
-        """Step 2: Chunk the parsed markdown content."""
-        if not doc.markdown:
-            raise ValueError(f"Cannot chunk doc {doc.id}, markdown content is missing.")
 
-        self._update_status(doc, DocumentStatus.CHUNKING, db=db)
-        try:
-            chunker = MarkdownChunker(
-                text=doc.markdown, config=self.chunking_config, title=doc.title
-            )
-
-            chunks, stats = await chunker.chunk()
-            logging.info(f"Chunking stats for doc {doc.id}: {stats}")
-
-            doc.chunks = serialize_docs(chunks)
-            self._update_status(doc, DocumentStatus.CHUNKED, db=db)
-        except Exception as e:
-            logging.error(f"Chunking failed for doc {doc.id}: {e}", exc_info=True)
-            self._update_status(
-                doc, DocumentStatus.FAILED, f"Chunking failed: {e}", db=db
-            )
-            raise
-
-    def _embed(self, doc: Document, db: Session):
-        """Step 3: Embed the chunks and store them in the vector database."""
-        if not doc.chunks:
-            raise ValueError(f"Cannot embed doc {doc.id}, chunks are missing.")
-
-        self._update_status(doc, DocumentStatus.EMBEDDING, db=db)
-        try:
-            langchain_docs = deserialize_docs(doc.chunks)
-
-            # Add document ID to each chunk's metadata for traceability
-            for chunk in langchain_docs:
-                chunk.metadata["original_doc_id"] = doc.id
-                chunk.metadata["original_doc_title"] = doc.title
-
-            vector_ids = self.vector_store_manager.embed_documents(langchain_docs)
-
-            if len(vector_ids) != len(langchain_docs):
-                logging.warning(
-                    f"Mismatch in embedded docs for doc {doc.id}. Expected {len(langchain_docs)}, got {len(vector_ids)}"
-                )
-
-            self._update_status(
-                doc,
-                DocumentStatus.COMPLETED,
-                f"Successfully embedded {len(vector_ids)} chunks.",
-                db=db,
-            )
-        except Exception as e:
-            logging.error(f"Embedding failed for doc {doc.id}: {e}", exc_info=True)
-            self._update_status(
-                doc, DocumentStatus.FAILED, f"Embedding failed: {e}", db=db
-            )
-            raise
-
+# ============================================================================
+# MAIN (for testing)
+# ============================================================================
 
 if __name__ == "__main__":
-    # To run this script, execute `python -m ingestion.orchestrator` from the project root.
-    # IMPORTANT:
-    # 1. Ensure your .env file is configured with DATABASE_URL and LLAMAPARSE_API.
-    # 2. If this is the first time, uncomment the init_db() line to create the tables.
+    """
+    Test orchestrator with sample document.
 
-    # --- (Optional) Run this once to initialize the database ---
-    print("Initializing database...")
-    from db.database import init_db
+    To run: python -m ingestion.orchestrator
+    """
+    import asyncio
 
-    init_db()
-    print("Database initialized.")
-
+    # Create orchestrator
     orchestrator = IngestionOrchestrator(
         vector_store_config=VectorStoreConfig(
             collection_name="documents",
             connection_string=os.getenv("DATABASE_URL"),
         )
     )
-    # Example usage
-    source = 2
-    # tags = ["example", "test"]
-    asyncio.run(orchestrator.process(source))
+
+    # Test with a source (update this to a real file path or URL)
+    source = "https://example.com"  # or "path/to/file.pdf"
+
+    try:
+        result = asyncio.run(orchestrator.process(source))
+        print(f"\n=== Pipeline Result ===")
+        print(f"Source: {result['source']}")
+        print(f"Title: {result['title']}")
+        print(f"Chunks: {result['chunk_count']}")
+        print(f"Success: {result['success']}")
+        print(f"Stage Results: {result['stage_results']}")
+        if result['errors']:
+            print(f"Errors: {result['errors']}")
+    except Exception as e:
+        print(f"Pipeline failed: {e}")

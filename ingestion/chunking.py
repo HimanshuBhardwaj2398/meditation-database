@@ -2,6 +2,7 @@ import asyncio
 import logging
 import re
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -11,13 +12,9 @@ from langchain.text_splitter import MarkdownHeaderTextSplitter
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
+from core.exceptions import ChunkingError
+
 logger = logging.getLogger(__name__)
-
-
-class ChunkingError(Exception):
-    """Chunking operation failed."""
-
-    pass
 
 
 @dataclass
@@ -48,10 +45,113 @@ class ChunkingStats:
     avg_chunk_size: float = 0.0
 
 
-class MarkdownChunker:
-    """Production Markdown document chunker."""
+# ============================================================================
+# THREAD-SAFE EMBEDDINGS CACHE
+# ============================================================================
 
-    _embeddings_cache: Dict[str, Any] = {}
+class ThreadSafeEmbeddingsCache:
+    """
+    Thread-safe singleton cache for embedding models.
+
+    Uses double-checked locking pattern for thread safety.
+    Each model has its own lock to allow concurrent loading of different models.
+    """
+
+    _instance: Optional["ThreadSafeEmbeddingsCache"] = None
+    _instance_lock = threading.Lock()
+
+    def __new__(cls):
+        """
+        Singleton pattern with thread-safe initialization.
+
+        Uses double-checked locking for performance.
+        """
+        if cls._instance is None:
+            with cls._instance_lock:
+                # Double-check inside lock
+                if cls._instance is None:
+                    instance = super().__new__(cls)
+                    instance._cache: Dict[str, HuggingFaceEmbeddings] = {}
+                    instance._model_locks: Dict[str, threading.Lock] = {}
+                    instance._locks_lock = threading.Lock()  # Lock for managing locks dict
+                    cls._instance = instance
+        return cls._instance
+
+    def _get_model_lock(self, model_name: str) -> threading.Lock:
+        """Get or create lock for specific model (thread-safe)."""
+        with self._locks_lock:
+            if model_name not in self._model_locks:
+                self._model_locks[model_name] = threading.Lock()
+            return self._model_locks[model_name]
+
+    def get_embeddings(self, model_name: str) -> HuggingFaceEmbeddings:
+        """
+        Get or create embeddings model with thread-safe access.
+
+        Args:
+            model_name: HuggingFace model identifier
+
+        Returns:
+            Cached or newly created embeddings model
+
+        Raises:
+            ChunkingError: If model loading fails
+        """
+        # Fast path: model already cached (no lock needed for read)
+        if model_name in self._cache:
+            logger.debug(f"Using cached embeddings model: {model_name}")
+            return self._cache[model_name]
+
+        # Slow path: need to load model (acquire model-specific lock)
+        model_lock = self._get_model_lock(model_name)
+        with model_lock:
+            # Double-check inside lock (another thread might have loaded it)
+            if model_name in self._cache:
+                logger.debug(f"Model loaded by another thread: {model_name}")
+                return self._cache[model_name]
+
+            # Load model
+            try:
+                logger.info(f"Loading embeddings model: {model_name}")
+                start_time = time.time()
+
+                embeddings = HuggingFaceEmbeddings(model_name=model_name)
+
+                load_time = time.time() - start_time
+                logger.info(f"Loaded {model_name} in {load_time:.2f}s")
+
+                # Cache it
+                self._cache[model_name] = embeddings
+                return embeddings
+
+            except Exception as e:
+                logger.error(f"Failed to load embeddings model {model_name}: {e}")
+                raise ChunkingError(f"Failed to load embeddings model: {e}") from e
+
+    def clear_cache(self):
+        """Clear all cached models (for testing or memory management)."""
+        with self._instance_lock:
+            self._cache.clear()
+            logger.info("Cleared embeddings cache")
+
+    def get_cache_info(self) -> Dict[str, Any]:
+        """Get information about cached models."""
+        return {
+            "cached_models": list(self._cache.keys()),
+            "cache_size": len(self._cache)
+        }
+
+
+# ============================================================================
+# MARKDOWN CHUNKER
+# ============================================================================
+
+class MarkdownChunker:
+    """
+    Production Markdown document chunker.
+
+    Uses thread-safe singleton cache for embeddings models.
+    """
 
     def __init__(
         self,
@@ -70,14 +170,9 @@ class MarkdownChunker:
         )
 
     def _get_embeddings(self) -> Any:
-        """Get cached embeddings model."""
-        model = self.config.model
-        if model not in self._embeddings_cache:
-            try:
-                self._embeddings_cache[model] = HuggingFaceEmbeddings(model_name=model)
-            except Exception as e:
-                raise ChunkingError(f"Failed to load embeddings: {e}")
-        return self._embeddings_cache[model]
+        """Get embeddings model from thread-safe cache."""
+        cache = ThreadSafeEmbeddingsCache()
+        return cache.get_embeddings(self.config.model)
 
     def _extract_title(self) -> str:
         """Extract title from first H1 header."""
