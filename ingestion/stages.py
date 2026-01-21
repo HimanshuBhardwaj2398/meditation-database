@@ -6,10 +6,11 @@ Stages receive a PipelineContext and return an updated context.
 """
 
 import logging
+import uuid as uuid_lib
 from typing import List
 
 from core.interfaces import PipelineStage, PipelineContext, StageStatus
-from core.exceptions import ParsingError, ChunkingError, EmbeddingError
+from core.exceptions import ParsingError, ChunkingError, EmbeddingError, DatabaseError
 from ingestion.parsing import ParserFactory
 from ingestion.chunking import MarkdownChunker, Config as ChunkingConfig
 from ingestion.embed import VectorStoreManager
@@ -208,10 +209,16 @@ class EmbeddingStage(PipelineStage):
         logger.info(f"Embedding {len(context.chunks)} chunks")
 
         try:
-            # Add document metadata to each chunk
-            for chunk in context.chunks:
+            # Add UUIDs and metadata to each chunk BEFORE embedding
+            for idx, chunk in enumerate(context.chunks):
+                # Generate UUID for linking with database
+                chunk_uuid = str(uuid_lib.uuid4())
+
+                # Add to metadata
+                chunk.metadata["uuid"] = chunk_uuid
                 chunk.metadata["original_doc_id"] = context.document_id
                 chunk.metadata["original_doc_title"] = context.title
+                chunk.metadata["chunk_index"] = idx
 
             # Embed and store in vector database
             vector_ids = self.vector_store_manager.embed_documents(context.chunks)
@@ -231,4 +238,105 @@ class EmbeddingStage(PipelineStage):
             return context.mark_stage_failed(self.name, str(e))
         except Exception as e:
             logger.error(f"Unexpected error in embedding stage: {e}", exc_info=True)
+            return context.mark_stage_failed(self.name, f"Unexpected error: {e}")
+
+
+# ============================================================================
+# STAGE 4: DATABASE PERSISTENCE
+# ============================================================================
+
+class DatabasePersistenceStage(PipelineStage):
+    """
+    Stage 4: Save document and chunk metadata to database.
+
+    Dependencies: embedding
+    Input: context.document_id, context.chunks (with UUIDs from vector store)
+    Output: Chunks saved to database, document status updated to COMPLETED
+    """
+
+    @property
+    def name(self) -> str:
+        return "database_persistence"
+
+    @property
+    def required_stages(self) -> List[str]:
+        return ["embedding"]
+
+    async def execute(self, context: PipelineContext) -> PipelineContext:
+        """
+        Save document and chunk metadata to database.
+
+        Args:
+            context: Pipeline context with embedded chunks
+
+        Returns:
+            Context marked as persistence completed
+
+        Raises:
+            DatabaseError: If database operations fail
+        """
+        from db.database import session_scope
+        from db.crud import DocumentCRUD, ChunkCRUD
+        from db.schema import DocumentStatus
+
+        if not context.document_id:
+            raise DatabaseError("No document_id in context")
+
+        if not context.chunks:
+            logger.warning("No chunks to persist")
+            return context.mark_stage_completed(self.name)
+
+        logger.info(f"Persisting {len(context.chunks)} chunks to database")
+
+        try:
+            with session_scope() as session:
+                doc_crud = DocumentCRUD(session)
+                chunk_crud = ChunkCRUD(session)
+
+                # Prepare chunk data for database
+                chunks_data = []
+                for idx, chunk in enumerate(context.chunks):
+                    # Extract UUID from metadata (added by EmbeddingStage)
+                    chunk_uuid = chunk.metadata.get("uuid")
+                    if not chunk_uuid:
+                        # Generate UUID if not present (shouldn't happen)
+                        chunk_uuid = str(uuid_lib.uuid4())
+                        logger.warning(
+                            f"Chunk {idx} missing UUID, generated: {chunk_uuid}"
+                        )
+
+                    chunks_data.append({
+                        "uuid": chunk_uuid,
+                        "chunk_text": chunk.page_content,
+                        "chunk_index": idx,
+                        "chunk_metadata": chunk.metadata,
+                    })
+
+                # Save chunks to database
+                created_chunks = chunk_crud.create_chunks_batch(
+                    document_id=context.document_id,
+                    chunks_data=chunks_data,
+                )
+
+                logger.info(f"✓ Saved {len(created_chunks)} chunks to database")
+
+                # Update document status to COMPLETED
+                doc_crud.update_status(
+                    document_id=context.document_id,
+                    status=DocumentStatus.COMPLETED,
+                    status_details=f"Successfully processed {len(created_chunks)} chunks",
+                )
+
+                # Clear temporary chunk storage
+                doc_crud.clear_chunks(context.document_id)
+
+                logger.info(f"✓ Document {context.document_id} marked as COMPLETED")
+
+            return context.mark_stage_completed(self.name)
+
+        except DatabaseError as e:
+            logger.error(f"Database persistence failed: {e}")
+            return context.mark_stage_failed(self.name, str(e))
+        except Exception as e:
+            logger.error(f"Unexpected error in persistence stage: {e}", exc_info=True)
             return context.mark_stage_failed(self.name, f"Unexpected error: {e}")

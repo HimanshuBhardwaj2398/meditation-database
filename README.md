@@ -223,25 +223,6 @@ This project includes translations of the Pali Canon by Bhikkhu Sujato:
 - [ ] **Daily Reflection Generator**: Contextual wisdom for specific situations
 - [ ] Multi-modal support (audio dharma talks, video transcripts)
 
-## Development
-
-### Using with Claude
-
-This project includes a `claude.md` file that provides comprehensive context about the architecture, design decisions, and development patterns. If you're using Claude for development assistance:
-
-1. The `claude.md` file is excluded from git (in `.gitignore`)
-2. Share it with Claude to get contextual help with the codebase
-3. Update it as the architecture evolves
-
-### Contributing
-
-When making changes:
-- Follow the established async/await patterns
-- Add type hints to all new functions
-- Update `claude.md` if architecture changes significantly
-- Maintain Pydantic settings for new configuration
-- Test with sample Buddhist texts in `Books/` directory
-
 ## License
 
 This project is for personal and educational use. The included Buddhist texts are translations by Bhikkhu Sujato, available under Creative Commons.

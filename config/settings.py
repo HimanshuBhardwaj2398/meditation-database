@@ -16,10 +16,24 @@ class DatabaseSettings(BaseSettings):
 
     url: str = Field(
         default="",
-        description="PostgreSQL connection URL (e.g., postgresql://user:pass@host:port/db)",
+        description="PostgreSQL connection URL (Supabase or local)",
     )
-    pool_size: int = Field(default=5, description="Connection pool size")
-    max_overflow: int = Field(default=10, description="Max overflow connections")
+    pool_size: int = Field(
+        default=10,
+        description="Connection pool size (Supabase recommends 10)",
+    )
+    max_overflow: int = Field(
+        default=20,
+        description="Max overflow connections (Supabase recommends 20)",
+    )
+    pool_timeout: int = Field(
+        default=30,
+        description="Pool checkout timeout in seconds",
+    )
+    pool_recycle: int = Field(
+        default=3600,
+        description="Recycle connections after N seconds (1 hour)",
+    )
     echo: bool = Field(default=False, description="Echo SQL queries (for debugging)")
 
     @field_validator("url", mode="before")
@@ -30,7 +44,16 @@ class DatabaseSettings(BaseSettings):
 
         if not v:
             v = os.getenv("DATABASE_URL", "")
+        if not v:
+            raise ValueError(
+                "Database URL must be set via DB_URL or DATABASE_URL environment variable"
+            )
         return v
+
+    @property
+    def is_supabase(self) -> bool:
+        """Check if using Supabase database."""
+        return "supabase.com" in self.url or "supabase.co" in self.url
 
 
 class EmbeddingSettings(BaseSettings):

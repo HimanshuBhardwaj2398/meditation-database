@@ -9,11 +9,11 @@ import os
 from typing import Union, List, Dict, Any, Optional
 
 from core.interfaces import PipelineStage, PipelineContext, StageStatus
-from core.exceptions import PipelineError, DatabaseError
+from core.exceptions import PipelineError, DatabaseError, DocumentNotFoundError
 from ingestion.parsing import ParserFactory
 from ingestion.chunking import Config as ChunkingConfig
 from ingestion.embed import VectorStoreManager, VectorStoreConfig
-from ingestion.stages import ParsingStage, ChunkingStage, EmbeddingStage
+from ingestion.stages import ParsingStage, ChunkingStage, EmbeddingStage, DatabasePersistenceStage
 
 # LangChain Document for type hints
 from langchain.schema import Document as LangchainDocument
@@ -194,14 +194,14 @@ class IngestionOrchestrator:
     High-level orchestrator for document ingestion.
 
     Provides backward-compatible API while using DAG pipeline internally.
-    Note: Database persistence is not included in Phase 1 (code refactoring only).
-    Database integration will be added in Phase 2 after schema is created.
+    Includes database persistence for tracking document and chunk metadata.
     """
 
     def __init__(
         self,
         vector_store_config: VectorStoreConfig,
         chunking_config: Optional[ChunkingConfig] = None,
+        enable_database_persistence: bool = True,
     ):
         """
         Initialize ingestion orchestrator.
@@ -209,9 +209,11 @@ class IngestionOrchestrator:
         Args:
             vector_store_config: Configuration for vector store
             chunking_config: Configuration for chunking (optional)
+            enable_database_persistence: Enable database stage (default True)
         """
         self.vector_store_config = vector_store_config
         self.chunking_config = chunking_config or ChunkingConfig()
+        self.enable_database_persistence = enable_database_persistence
 
         # Initialize components
         self.parser_factory = ParserFactory()
@@ -219,23 +221,54 @@ class IngestionOrchestrator:
 
         logger.info("IngestionOrchestrator initialized with DAG pipeline")
 
-    async def process(self, source: Union[str, int]) -> Dict[str, Any]:
+    async def process(
+        self,
+        source: Union[str, int],
+        title: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Process a document through the ingestion pipeline.
 
         Args:
             source: File path, URL, or document ID to resume
+            title: Optional title (will be extracted if not provided)
 
         Returns:
             Dictionary with processing results:
+                - document_id: Database ID of the document
                 - source: Original source
                 - title: Extracted title
                 - chunk_count: Number of chunks created
                 - stage_results: Status of each stage
                 - errors: Any error messages
+                - success: Whether pipeline completed successfully
         """
-        # For Phase 1: Process without database
-        # Database integration will be added in Phase 2
+        from db.database import session_scope
+        from db.crud import DocumentCRUD
+        from db.schema import DocumentStatus
+
+        # Create or load document
+        document_id = None
+        if isinstance(source, int):
+            # Resume existing document
+            with session_scope() as session:
+                doc = DocumentCRUD(session).get_document_by_id(source)
+                if not doc:
+                    raise DocumentNotFoundError(f"Document {source} not found")
+                source = doc.file_path
+                title = doc.title
+                document_id = source
+                logger.info(f"Resuming document {document_id}: {title}")
+        else:
+            # Create new document
+            with session_scope() as session:
+                doc = DocumentCRUD(session).create_document(
+                    title=title or "Untitled",
+                    file_path=source,
+                    status=DocumentStatus.PENDING,
+                )
+                document_id = doc.id
+                logger.info(f"Created document {document_id} for source: {source}")
 
         # Build pipeline stages
         stages = [
@@ -244,45 +277,71 @@ class IngestionOrchestrator:
             EmbeddingStage(self.vector_store_manager),
         ]
 
+        # Add database persistence stage if enabled
+        if self.enable_database_persistence:
+            stages.append(DatabasePersistenceStage())
+
         # Create orchestrator
         pipeline = PipelineOrchestrator(stages)
 
         # Build initial context
         context = PipelineContext(
-            source=source if isinstance(source, str) else None,
+            document_id=document_id,
+            source=source,
+            title=title,
         )
 
         try:
             # Execute pipeline
-            logger.info(f"Starting pipeline for source: {source}")
+            logger.info(f"Starting pipeline for document {document_id}")
             final_context = await pipeline.execute(context)
 
             # Check completion status
-            embedding_status = final_context.stage_results.get("embedding")
-            success = embedding_status == StageStatus.COMPLETED
+            if self.enable_database_persistence:
+                success_stage = "database_persistence"
+            else:
+                success_stage = "embedding"
+
+            status = final_context.stage_results.get(success_stage)
+            success = status == StageStatus.COMPLETED
 
             # Build result
             result = {
-                "source": context.source,
+                "document_id": document_id,
+                "source": source,
                 "title": final_context.title,
-                "chunk_count": len(final_context.chunks),
+                "chunk_count": len(final_context.chunks) if final_context.chunks else 0,
                 "stage_results": {
                     name: status.value
                     for name, status in final_context.stage_results.items()
                 },
                 "errors": final_context.error_messages,
-                "success": success
+                "success": success,
             }
 
             if success:
-                logger.info(f"Pipeline completed successfully for: {source}")
+                logger.info(f"Pipeline completed successfully for document {document_id}")
             else:
-                logger.warning(f"Pipeline partially completed for: {source}")
+                logger.warning(f"Pipeline partially completed for document {document_id}")
+                # Update document status to FAILED
+                with session_scope() as session:
+                    DocumentCRUD(session).update_status(
+                        document_id=document_id,
+                        status=DocumentStatus.FAILED,
+                        status_details=str(final_context.error_messages),
+                    )
 
             return result
 
         except Exception as e:
-            logger.error(f"Pipeline failed for source {source}: {e}", exc_info=True)
+            logger.error(f"Pipeline failed for document {document_id}: {e}", exc_info=True)
+            # Update document status to FAILED
+            with session_scope() as session:
+                DocumentCRUD(session).update_status(
+                    document_id=document_id,
+                    status=DocumentStatus.FAILED,
+                    status_details=str(e),
+                )
             raise PipelineError(f"Pipeline execution failed: {e}") from e
 
 

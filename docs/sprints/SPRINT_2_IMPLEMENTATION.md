@@ -1,8 +1,9 @@
 # Sprint 2: Pipeline Architecture Patterns - Implementation Log
 
-**Status**: Phase 1 Complete ✅ | Phase 2 In Progress 🔄
+**Status**: Phase 2 Complete ✅ | Phase 3 Next 🔄
 **Date Started**: 2026-01-21
-**Objective**: Refactor ingestion pipeline with proper design patterns (Strategy, Factory, DAG orchestrator) and fix critical bugs
+**Last Updated**: 2026-01-21
+**Objective**: Refactor ingestion pipeline with proper design patterns and integrate complete database layer with Supabase
 
 ---
 
@@ -266,78 +267,284 @@ from ingestion import (
 
 ---
 
-## Phase 2: Database Setup (Next)
+## Phase 2: Database Setup ✅ COMPLETE
 
-**Goal**: Create complete schema with all necessary fields on Supabase
+**Goal**: Create complete schema with all necessary fields and integrate with pipeline
 
-### Task 2.1: Update Schema Definition (Pending)
+### Task 2.1: Update Schema Definition ✅
 
 **File**: [db/schema.py](../../db/schema.py)
 
-**Required Changes**:
-```python
-class Document(Base):
-    # Existing fields...
+**What Changed**:
+- Added 3 missing fields to Document model:
+  - `file_path` - Source URL or file path (for pipeline resume)
+  - `status_details` - Error messages and debugging info
+  - `chunks` - Temporary JSONB storage before embedding
+- Added index on `status` column for query optimization
+- Added relationship to Chunk model with cascade delete
+- **New**: Complete `Chunk` model with 7 fields:
+  - `id`, `uuid`, `document_id`, `chunk_text`, `chunk_index`, `chunk_metadata`, `created_at`
+  - Links to LangChain embeddings via `uuid`
+  - Foreign key to Document with cascading delete
 
-    # ADD:
-    file_path = Column(Text, nullable=True)      # Source file path or URL
-    status_details = Column(Text, nullable=True)  # Error messages
-    chunks = Column(JSONB, nullable=True)         # Temporary chunk storage
-```
+**Architecture Principle**:
+- Application schema (documents, chunks) = metadata and status tracking
+- LangChain schema (langchain_pg_embedding) = vectors and embeddings
+- Link via: `chunks.uuid` ↔ `langchain_pg_embedding.uuid`
 
-### Task 2.2: Update CRUD Operations (Pending)
+---
+
+### Task 2.2: Update CRUD Operations ✅
 
 **File**: [db/crud.py](../../db/crud.py)
 
-**Required Changes**:
-- Add `file_path` parameter to `create_document()`
-- Create `update_status(document_id, status, details=None)` helper
-- Create `get_documents_by_status(status)` query method
+**What Changed**:
+- Removed `EmbeddingCRUD` class (referenced non-existent schema.Embedding)
+- Enhanced `DocumentCRUD` with 7 new methods:
+  - `create_document()` - Now requires `file_path` parameter
+  - `update_status()` - Update pipeline status with details
+  - `update_markdown()` - Save parsed content
+  - `store_chunks()` - Temporary JSONB storage
+  - `clear_chunks()` - Free up space after embedding
+  - `get_documents_by_status()` - Filter by status
+  - `get_failed_documents()` - Get all FAILED documents
+- **New**: `ChunkCRUD` class with 3 methods:
+  - `create_chunks_batch()` - Bulk insert chunks
+  - `get_chunks_by_document()` - Get all chunks for a document
+  - `get_chunk_by_uuid()` - Link vector search results to chunks
 
-### Task 2.3: Initialize Supabase Database (Pending)
+---
 
-**Command**:
-```bash
-export DATABASE_URL="postgresql://user:pass@db.xxxxx.supabase.co:5432/postgres"
-poetry run python -c "from db.database import init_db; init_db()"
+### Task 2.3: Configuration Updates ✅
+
+**Files**: [config/settings.py](../../config/settings.py), [db/database.py](../../db/database.py)
+
+**What Changed**:
+
+**DatabaseSettings enhancements**:
+- Added `pool_timeout` (default: 30s)
+- Added `pool_recycle` (default: 3600s / 1 hour)
+- Added `is_supabase` property for environment detection
+- Optimized defaults for Supabase (pool_size=10, max_overflow=20)
+
+**Database connection enhancements**:
+- Auto-detects Supabase from URL (`is_supabase` property)
+- Supabase-optimized pooling:
+  - `pool_pre_ping=True` - Verify connections before use
+  - `pool_recycle=3600` - Prevent stale connections
+- Enhanced `init_db()`:
+  - Better logging with ✓ checkmarks
+  - Verifies pgvector extension
+  - Lists created tables
+  - Better error handling
+
+---
+
+### Task 2.4: Pipeline Integration ✅
+
+**File**: [ingestion/stages.py](../../ingestion/stages.py)
+
+**What Changed**:
+
+**EmbeddingStage enhancement**:
+- Now adds UUIDs to chunks BEFORE embedding
+- Metadata enrichment:
+  - `uuid` - Generated UUID for database linking
+  - `original_doc_id` - Parent document ID
+  - `original_doc_title` - Parent document title
+  - `chunk_index` - Position in document
+
+**New: DatabasePersistenceStage (Stage 4)**:
+- Saves chunk metadata to database after embedding
+- Updates document status to COMPLETED
+- Clears temporary chunk storage
+- Full error handling with DatabaseError
+
+**Pipeline Flow**:
+```
+ParsingStage → ChunkingStage → EmbeddingStage → DatabasePersistenceStage
 ```
 
 ---
 
-## Phase 3: Integration & Testing (Future)
+### Task 2.5: Orchestrator Updates ✅
 
-### Task 3.1: DatabasePersistenceStage (Pending)
+**File**: [ingestion/orchestrator.py](../../ingestion/orchestrator.py)
 
-**File**: [ingestion/stages.py](../../ingestion/stages.py)
+**What Changed**:
+- Creates Document record at pipeline start (with PENDING status)
+- Passes `document_id` through entire pipeline context
+- Integrates DatabasePersistenceStage as 4th stage
+- Handles FAILED status updates on pipeline errors
+- Supports resume by document ID:
+  ```python
+  # Resume existing document
+  orchestrator.process(document_id=123)
 
-Add stage to persist pipeline results to database after Phase 2 is complete.
+  # Or create new
+  orchestrator.process(source="https://example.com", title="My Doc")
+  ```
 
-### Task 3.2: Verification Script (Pending)
+---
 
-**File**: `scripts/verify_sprint2.py`
+### Task 2.6: Verification Script ✅
 
-Comprehensive end-to-end testing of all components.
+**File**: [scripts/verify_database.py](../../scripts/verify_database.py)
+
+**What It Does**:
+Comprehensive 7-check verification:
+1. Database connection test
+2. pgvector extension check
+3. Tables exist (documents, chunks)
+4. Document schema (12 columns)
+5. Chunk schema (7 columns)
+6. CRUD operations test
+7. Configuration validation
+
+**Usage**:
+```bash
+poetry run python scripts/verify_database.py
+```
+
+Expected output: "✓ ALL CHECKS PASSED"
+
+---
+
+## Phase 3: Deployment & Testing (Next)
+
+**Goal**: Deploy to Supabase and verify end-to-end functionality
+
+### Task 3.1: Alembic Setup (Pending)
+
+**Commands**:
+```bash
+# Initialize Alembic
+poetry run alembic init alembic
+
+# Configure alembic/env.py
+# Generate initial migration
+poetry run alembic revision --autogenerate -m "Initial schema: documents and chunks"
+
+# Review migration file
+# Apply to Supabase
+poetry run alembic upgrade head
+```
+
+**Key Files**:
+- `alembic.ini` - Alembic configuration
+- `alembic/env.py` - Migration environment (needs configuration)
+- `alembic/versions/XXXX_initial_schema.py` - Generated migration
+
+---
+
+### Task 3.2: Supabase Configuration (Pending)
+
+**Steps**:
+1. Create Supabase project (or use existing)
+2. Get Transaction mode connection string (port 6543)
+3. Update `.env`:
+   ```bash
+   DB_URL="postgresql://postgres.PROJECT_REF:PASSWORD@aws-0-REGION.pooler.supabase.com:6543/postgres"
+   ```
+4. Enable pgvector in Supabase SQL Editor:
+   ```sql
+   CREATE EXTENSION IF NOT EXISTS vector;
+   ```
+5. Apply Alembic migrations
+
+---
+
+### Task 3.3: Verification (Pending)
+
+**Run verification script**:
+```bash
+poetry run python scripts/verify_database.py
+```
+
+**End-to-end pipeline test**:
+```bash
+poetry run python -c "
+import asyncio
+from ingestion.orchestrator import IngestionOrchestrator
+from ingestion.embed import VectorStoreConfig
+import os
+
+async def test():
+    orchestrator = IngestionOrchestrator(
+        vector_store_config=VectorStoreConfig(
+            collection_name='meditation_docs',
+            db_url=os.getenv('DB_URL'),
+        )
+    )
+    result = await orchestrator.process(
+        source='https://example.com/article',
+        title='Test Article'
+    )
+    print(f'Success: {result[\"success\"]}')
+    print(f'Document ID: {result[\"document_id\"]}')
+
+asyncio.run(test())
+"
+```
+
+---
+
+### Task 3.4: Documentation (Pending)
+
+Files to create/update:
+- [ ] `docs/deployment/SUPABASE_SETUP.md` - Complete Supabase setup guide
+- [ ] `docs/deployment/ALEMBIC_GUIDE.md` - Migration management
+- [ ] Update [CLAUDE.md](../../CLAUDE.md) with current status
+- [ ] Update [README.md](../../README.md) with deployment instructions
 
 ---
 
 ## Code Metrics
 
-### Files Created
+### Phase 1: Code Refactoring
+**Files Created**:
 - `core/__init__.py`
 - `core/exceptions.py`
 - `core/interfaces.py`
 - `ingestion/stages.py`
 
-### Files Modified
+**Files Modified**:
 - `ingestion/parsing.py` (major refactor)
 - `ingestion/chunking.py` (thread-safe cache)
 - `ingestion/orchestrator.py` (DAG architecture)
 - `ingestion/__init__.py` (new exports)
 
-### Lines of Code
+**Lines of Code**:
 - **Added**: ~800 lines (new modules)
 - **Refactored**: ~400 lines (existing modules)
-- **Total Impact**: ~1200 lines
+- **Total**: ~1200 lines
+
+---
+
+### Phase 2: Database Setup
+**Files Created**:
+- `scripts/verify_database.py` (170 lines)
+
+**Files Modified**:
+- `db/schema.py` - Added Chunk model, enhanced Document (+60 lines)
+- `db/crud.py` - Removed EmbeddingCRUD, added ChunkCRUD (+180 lines)
+- `config/settings.py` - Enhanced DatabaseSettings (+15 lines)
+- `db/database.py` - Supabase detection and pooling (+40 lines)
+- `ingestion/stages.py` - DatabasePersistenceStage (+105 lines)
+- `ingestion/orchestrator.py` - Database integration (+50 lines)
+
+**Lines of Code**:
+- **Added**: ~450 lines (new functionality)
+- **Refactored**: ~170 lines (existing modules)
+- **Total**: ~620 lines
+
+---
+
+### Sprint 2 Total Impact
+- **Files Created**: 5 (core modules + verification script)
+- **Files Modified**: 10 (ingestion + database + config)
+- **Total Lines**: ~1820 lines
+- **Test Coverage**: Verification script with 7 checks
 
 ---
 

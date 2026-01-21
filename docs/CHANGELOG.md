@@ -8,16 +8,85 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-### Sprint 2: Pipeline Architecture Patterns (Planned)
-- Strategy pattern for parsers (URL, PDF)
-- Parser Factory for automatic parser selection
-- Thread-safe caching in chunking module
-- DAG-based pipeline orchestrator with resume capability
+### Sprint 2: Pipeline Architecture Patterns (In Progress)
+
+#### Phase 1: Code Refactoring - COMPLETE ✅
+- **New**: `core/exceptions.py` - Central exception hierarchy
+  - `MeditationDBError` base exception
+  - Organized by category: Configuration, Pipeline, Database errors
+- **New**: `core/interfaces.py` - Core abstractions
+  - `Parser` protocol for parser implementations
+  - `ParseResult` dataclass for parser outputs
+  - `PipelineStage` ABC for pipeline stages
+  - `PipelineContext` with immutable update pattern
+  - `StageStatus` enum for execution tracking
+- **Refactored**: `ingestion/parsing.py` - Strategy pattern
+  - `URLParser` class for HTTP/HTTPS URLs
+  - `PDFParser` class for PDF files
+  - `ParserFactory` for automatic parser selection
+  - Backward-compatible deprecated functions (with warnings)
+- **Refactored**: `ingestion/chunking.py` - Thread-safe cache ⚠️ **CRITICAL FIX**
+  - `ThreadSafeEmbeddingsCache` singleton with double-checked locking
+  - Fixes race conditions with parallel processing
+  - Model-specific locks for concurrent loading
+- **New**: `ingestion/stages.py` - Individual pipeline stages
+  - `ParsingStage` - parse source documents
+  - `ChunkingStage` - chunk parsed markdown
+  - `EmbeddingStage` - embed and store chunks
+- **Refactored**: `ingestion/orchestrator.py` - DAG architecture
+  - `PipelineOrchestrator` with topological sort
+  - Automatic dependency resolution
+  - Cycle detection
+  - Backward-compatible `IngestionOrchestrator` API
+- **Updated**: `ingestion/__init__.py` - New API exports
+  - Maintains backward compatibility with old imports
+- **New**: `docs/sprints/` - Sprint documentation
+  - Implementation logs and phase guides
+  - Referenced from CLAUDE.md for easy access
+
+#### Phase 2: Database Setup - COMPLETE ✅
+- **Updated**: `db/schema.py` - Complete schema with all fields
+  - Added `file_path`, `status_details`, `chunks` to Document model
+  - Added index on `status` column for query optimization
+  - **New**: `Chunk` model with full relationships to Document
+  - Chunk ↔ LangChain embeddings linking via UUID
+- **Updated**: `db/crud.py` - Enhanced CRUD operations
+  - Removed broken `EmbeddingCRUD` (referenced non-existent model)
+  - Enhanced `DocumentCRUD` with 7 new methods:
+    - `update_status()`, `update_markdown()`, `store_chunks()`, `clear_chunks()`
+    - `get_documents_by_status()`, `get_failed_documents()`
+  - **New**: `ChunkCRUD` class with batch operations
+- **Updated**: `config/settings.py` - Supabase optimization
+  - Added `pool_timeout`, `pool_recycle` to DatabaseSettings
+  - Added `is_supabase` property for environment detection
+  - Optimized defaults for Supabase (pool_size=10, max_overflow=20)
+- **Updated**: `db/database.py` - Connection pooling
+  - Auto-detects Supabase vs local PostgreSQL
+  - Supabase-optimized pooling with `pool_pre_ping=True`
+  - Enhanced `init_db()` with verification and logging
+- **Updated**: `ingestion/stages.py` - UUID tracking and persistence
+  - `EmbeddingStage` now adds UUIDs to chunks before embedding
+  - **New**: `DatabasePersistenceStage` (Stage 4) - saves chunk metadata
+- **Updated**: `ingestion/orchestrator.py` - Database integration
+  - Creates Document record at pipeline start
+  - Integrates DatabasePersistenceStage as 4th stage
+  - Handles FAILED status updates on errors
+  - Supports resume by document ID
+- **New**: `scripts/verify_database.py` - 7-check verification script
+  - Connection, pgvector, tables, schema, CRUD, settings verification
+
+#### Phase 3: Deployment & Testing (Next)
+- [ ] Set up Alembic for database migrations
+- [ ] Configure Supabase project and apply migrations
+- [ ] Run verification script on Supabase
+- [ ] End-to-end pipeline testing
+- [ ] Update documentation with deployment guide
 
 ### Sprint 3: Database & Polish (Planned)
 - Alembic database migrations
 - Repository pattern for data access
-- Basic test suite
+- Unit of Work pattern
+- Comprehensive test suite (pytest)
 - Docker deployment documentation
 
 ---

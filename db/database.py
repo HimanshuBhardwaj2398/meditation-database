@@ -1,46 +1,85 @@
 """
-This module handles the database connection and session management for the application.
+Database connection and session management.
+Supports both local PostgreSQL and Supabase with optimized pooling.
 """
 
-import os
+import logging
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
-from dotenv import load_dotenv
-from .schema import Base  # Import Base from schema.py
-import logging
-
-## import context manager for session handling
 from contextlib import contextmanager
 
-# Load the .env file from the project root
-dotenv_path = os.path.join(os.path.dirname(__file__), "..", ".env")
-load_dotenv(dotenv_path=dotenv_path)
+from .schema import Base
+from config.settings import get_settings
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+logger = logging.getLogger(__name__)
 
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL environment variable not set in .env file")
+# Get settings
+settings = get_settings()
 
-# The engine is the entry point to the database.
-# `echo=False` is recommended for production.
-engine = create_engine(DATABASE_URL, echo=False)
+# Configure engine based on environment
+if settings.database.is_supabase:
+    # Supabase-optimized configuration
+    engine = create_engine(
+        settings.database.url,
+        pool_size=settings.database.pool_size,
+        max_overflow=settings.database.max_overflow,
+        pool_timeout=settings.database.pool_timeout,
+        pool_recycle=settings.database.pool_recycle,
+        pool_pre_ping=True,  # Verify connections before use
+        echo=settings.database.echo,
+    )
+    logger.info("Initialized Supabase database connection with pooling")
+else:
+    # Local development configuration
+    engine = create_engine(
+        settings.database.url,
+        pool_size=5,
+        max_overflow=10,
+        echo=settings.database.echo,
+    )
+    logger.info("Initialized local database connection")
 
-# A sessionmaker is a factory for creating Session objects.
+# Session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def init_db():
     """
-    Initializes the database and creates tables based on the SQLAlchemy models.
-    Call this function once when your application starts up.
+    Initialize database: create pgvector extension and all tables.
+
+    This should be run once when setting up a new database.
+    For Supabase, ensure pgvector extension is enabled.
     """
-    print("Initializing database and creating tables...")
-    with engine.connect() as connection:
-        connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        connection.commit()
-    # This creates the tables defined in schema.py
-    Base.metadata.create_all(bind=engine)
-    print("Database initialized successfully.")
+    logger.info("Initializing database...")
+
+    try:
+        # Create pgvector extension
+        with engine.connect() as connection:
+            connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            connection.commit()
+            logger.info("✓ pgvector extension enabled")
+
+        # Create all tables
+        Base.metadata.create_all(bind=engine)
+        logger.info("✓ Database tables created")
+
+        # Verify tables
+        with engine.connect() as connection:
+            result = connection.execute(
+                text(
+                    "SELECT tablename FROM pg_tables "
+                    "WHERE schemaname = 'public' "
+                    "ORDER BY tablename"
+                )
+            )
+            tables = [row[0] for row in result]
+            logger.info(f"✓ Tables in database: {', '.join(tables)}")
+
+        logger.info("Database initialization complete")
+
+    except Exception as e:
+        logger.error(f"Database initialization failed: {e}", exc_info=True)
+        raise
 
 
 # def get_engine():
@@ -64,15 +103,19 @@ def init_db():
 @contextmanager
 def session_scope():
     """
-    Provide a transactional scope around a series of database operations.
-    This is the recommended way to handle sessions.
+    Provide a transactional scope around database operations.
+
+    Usage:
+        with session_scope() as session:
+            doc = DocumentCRUD(session).create_document(...)
+            session.commit()
     """
     session = SessionLocal()
     try:
         yield session
         session.commit()
-    except Exception:
-        logging.info("Session rolled back due to an exception.")
+    except Exception as e:
+        logger.error(f"Session error: {e}")
         session.rollback()
         raise
     finally:
